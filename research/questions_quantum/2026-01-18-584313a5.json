@@ -1,0 +1,27 @@
+[
+    {
+        "id": 1,
+        "query": "How does quantum computing utilize superposition in optimization tasks?",
+        "rationale": "Relevant to understanding how superposition impacts optimization in quantum computing."
+    },
+    {
+        "id": 2,
+        "query": "What are the practical implications of quantum entanglement in cryptography?",
+        "rationale": "Explores the role of entanglement in enhancing security in cryptographic applications."
+    },
+    {
+        "id": 3,
+        "query": "How do quantum gates contribute to simulations in materials research?",
+        "rationale": "Understanding the role of quantum gates in simulating materials at a quantum level."
+    },
+    {
+        "id": 4,
+        "query": "What advances has Google made in quantum key distribution for secure communications?",
+        "rationale": "Clarifying Google's specific contributions to quantum key distribution technology."
+    },
+    {
+        "id": 5,
+        "query": "How can quantum computing be applied in optimization tasks within the finance industry?",
+        "rationale": "Connecting quantum computing to finance optimization for practical applications."
+    }
+]
