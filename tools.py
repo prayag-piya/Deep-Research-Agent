@@ -4,7 +4,12 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 from enum import Enum
+import json
+from dotenv import find_dotenv, load_dotenv
+from tavily import TavilyClient
+from langchain_core.tools import tool
 
+load_dotenv(find_dotenv())
 
 class DirectoryMapping(Enum):
     QUESTION = "questions"
@@ -16,9 +21,52 @@ class DirectoryMapping(Enum):
     TODO = "todo"
 
 root_dir = "/mnt/d/Personal Projects/deep_agent/research"
+TAVILY_CLIENT = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+
+@tool
+def tavily_search(query: str) -> str:
+    """Search the web for information on a given topic.
+
+    Args:
+        query: The search query string
+    """
+    try:
+        results = TAVILY_CLIENT.search(
+            query=query,
+            max_results=5,
+            search_depth="advanced",
+            include_answer=True,
+            include_images=False,
+            time_range="year",
+            # No start_date or end_date
+        )
+        return json.dumps(results)  # Always return valid JSON string
+    except Exception as e:
+        return json.dumps({"error": str(e), "results": []})
 
 
-def search_tool(state, thread_id: str):
+@tool
+def tavily_search_basic(query: str) -> str:
+    """Search the web for basic information on a given topic.
+
+    Args:
+        query: The search query string
+    """
+    try:
+        results = TAVILY_CLIENT.search(
+            query=query,
+            max_results=5,
+            search_depth="basic",
+            include_answer=True,
+            include_images=False,
+            time_range="year",
+        )
+        return json.dumps(results)
+    except Exception as e:
+        return json.dumps({"error": str(e), "results": []})
+
+
+def search_tool(state, thread_id: str) -> str | None:
     """_summary_
 
     Args:
@@ -34,6 +82,136 @@ def search_tool(state, thread_id: str):
                 return file.name
     else:
         return None
+
+
+def read_todo(thread_id: str) -> dict:
+    """Read todo function reads the todo task
+
+    Args:
+        thread_id (str): thread_id is used to name file and search the file
+
+    Returns:
+        dict: Returns TODO which is list of task 
+    """
+    file_name = search_tool({"phase": "TODO"}, thread_id)
+    if file_name != None:
+        root_path = f"{Path(root_dir).joinpath(f"todo_{thread_id}")}/{file_name}"
+        with open(root_path, "r") as file:
+            return json.load(file)
+    return {"Error": "No todos found in research folder"}
+
+def write_todo(thread_id: str, content) -> dict:
+    """Create or update the todo list
+    calls search tool to locate the file if no file is found creates a todo list file
+    Args:
+        thread_id (str): thread_id is used to name file and search the file
+        content (dict): Data to update todo list or create todo list
+
+    Returns:
+        dict: returns the content argument
+    """
+    file_name = search_tool({"phase": "TODO"}, thread_id)
+    if file_name != None:
+        root_path = f"{Path(root_dir).joinpath(f"todo_{thread_id}")}/{file_name}"
+        with open(root_path, "r") as file:
+            todos = json.load(file)
+        for count, todo in enumerate(todos):
+            if todo["id"] == content["id"]:
+                todos[count] = content
+        with open(root_path, "w") as file:
+            json.dump(todos, file)
+        return content
+    else:
+        date = datetime.now().date()
+        Path(f"{root_dir}/todo_{thread_id}").mkdir(parents=True, exist_ok=True)
+        root_path = f"{Path(root_dir).joinpath(f"todo_{thread_id}")}/{date}-{uuid4().hex[:8]}.json"
+        with open(root_path, "w") as file:
+            json.dump(content, file)
+        return content
+        
+
+def read_file(folder: str, thread_id: str, filename = None) -> list:
+    """Read file function reads specific file if filename provided or read entire folder
+
+    Args:
+        folder (str): Name of the folder where file is located
+        thread_id (str): thread_id is used to name file and search the file
+        filename (_type_, optional): Filename if you want to read only specific file. Defaults to None.
+
+    Returns:
+        dict: return contains of the folder or content of folder in key value pair with filename as key 
+    """
+    if filename != None:
+        target_file = Path(root_dir).joinpath(f"{folder}_{thread_id}/{filename}")
+        with open(target_file, "r") as file:
+            data = json.load(file)
+            return data
+    else:
+        datas = []
+        target_folder = Path(root_dir).joinpath(f"{folder}_{thread_id}")
+        for files in Path(target_folder).glob("*.json"):
+            data = json.loads(files.read_text())
+            datas.extend(data)
+        return datas
+
+def edit_file(content: dict, filename: Path):
+    data = json.loads(filename.read_text())
+    id = len(data) + 1
+    content["id"] = id
+    data.append(content)
+    with open(filename, "w") as file:
+        json.dump(data, file)
+
+def write_file(folder: str, thread_id: str, contents: list[dict]) -> list[dict]:
+    date = datetime.now().date()
+    root_path = f"{Path(root_dir).joinpath(f"{folder}_{thread_id}")}"
+    Path(root_path).mkdir(parents=True, exist_ok=True)
+    for file in Path(root_path).glob("*.json"):
+        filename = "-".join(file.name.split("-")[:-1])
+        if filename == f"{date}":
+            for content in contents:
+                edit_file(content, file)
+            return contents
+    with open(f"{root_path}/{date}-{uuid4().hex[:8]}.json", "w") as file:
+        json.dump(contents, file)
+    return contents
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 def write_json_tool(state, content, thread_id: str, filename=None):
     """This tool write content to file for agent memory
@@ -141,4 +319,4 @@ def search_file_with_keyword(state, query, key, thread_id: str, filename = None 
     else:
         return None
 
-edit_json_tool({"phase": "TODO"}, {"id": 1, "status": "In Progress"}, "quatum_beats", "2026-01-17-10361edb.json")
+# write_file("todo", "quantum", [{"some": "new"}])

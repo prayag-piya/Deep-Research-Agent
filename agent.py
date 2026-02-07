@@ -1,8 +1,14 @@
 import os
 import json
-from pydantic import SecretStr
+import ast 
+from typing import Literal
+from functools import lru_cache
+from datetime import datetime
+import uuid
+from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
+from langchain_core.rate_limiters import InMemoryRateLimiter
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Send, Command
 from langgraph.graph import StateGraph, START, END
@@ -10,24 +16,35 @@ from langchain_core.runnables import RunnableConfig
 from langchain.agents import create_agent
 
 from states import OverallState, QueryGenerationState, TaskListState, Query
-from schema import TaskListSchema, FollowQuestion
+from schema import TaskListSchema, FollowQuestion, Classifier, Draft, SearchQuery
 from configration import Configration
-from prompt import todo_task, ask_detail_question, brief_answer, question_generator
-from utils import get_task_topic
-from tools import read_tool, write_json_tool, search_file_with_keyword, edit_json_tool, search_tool
+from prompt import todo_task, ask_detail_question, brief_answer, question_generator, classifier, draft_writer
+from utils import get_task_topic, TokenManger
+from tools import write_file, write_todo, read_file, tavily_search_basic, tavily_search
 
-from langchain_openai import ChatOpenAI
-from langchain_tavily import TavilySearch
+from langchain_ollama import ChatOllama
+# from langchain_openai import ChatOpenAI
 
 load_dotenv(find_dotenv())
 
-thread_id = "quantum"
+thread_id = "hsi"
+
+rate_limiter = InMemoryRateLimiter(requests_per_second=0.1, max_bucket_size=10)
 
 if os.getenv("OPENROUTER_API_KEY") is None:
     raise ValueError("OPENROUTER Key not Found.")
 
 if os.getenv("TAVILY_API_KEY") is None:
     raise ValueError("Tavily Key not Found.")
+
+@lru_cache(maxsize=None)
+def get_llm(model: str = "llama3.2:latest", temperature: float = 0.7) -> ChatOllama:
+    return ChatOllama(
+        model=model,
+        temperature=temperature,
+        # api_key=os.getenv("OPENROUTER_API_KEY"),
+        # base_url="https://openrouter.ai/api/v1"
+    )
 
 
 def indepth_reasoning(state: OverallState, config: RunnableConfig):
@@ -41,13 +58,7 @@ def indepth_reasoning(state: OverallState, config: RunnableConfig):
     """
     
     configurable =  Configration.from_runnable_config(config)
-    
-    llm = ChatOpenAI(
-        api_key=SecretStr(os.getenv("OPENROUTER_API_KEY") or ""),
-        temperature=1.0,
-        base_url="https://openrouter.ai/api/v1"
-    )
-    
+    llm = get_llm(temperature=0.5)
     formatted_prompt = f"""
                         {ask_detail_question}
                         \n\n
@@ -55,10 +66,10 @@ def indepth_reasoning(state: OverallState, config: RunnableConfig):
                         {get_task_topic(state["messages"])}. ask me {configurable.max_question} question
                         """
     result = llm.invoke(formatted_prompt)
-    print(result)
     # This to ask user questtion to understand their intend
+    print(result.content)
     user_input = input(">>")
-    state["messages"] += HumanMessage(content=user_input)
+    state["messages"] += [HumanMessage(content=user_input)]
     breif_task_prompt = f"""
                         {brief_answer}
                         \n\n
@@ -66,6 +77,8 @@ def indepth_reasoning(state: OverallState, config: RunnableConfig):
                         """
     result = llm.invoke(breif_task_prompt)
     return {"brief": result.content}
+
+
 
 def generate_tasklist(state: OverallState, config: RunnableConfig) -> TaskListState:
     """Langgraph node that generate overall plan for the task base on user's question.
@@ -79,14 +92,8 @@ def generate_tasklist(state: OverallState, config: RunnableConfig) -> TaskListSt
     Returns:
         TaskListState: Dictionary with state update and tasking for agent planning.
     """
-    state["phase"] = "TODO"
     configurable = Configration.from_runnable_config(config)
-    
-    llm = ChatOpenAI(
-        api_key=SecretStr(os.getenv("OPENROUTER_API_KEY") or ""),
-        temperature=1.0,
-        base_url="https://openrouter.ai/api/v1",
-    )
+    llm = get_llm(temperature=0.3)
     
     structured_llm = llm.with_structured_output(TaskListSchema)
     formatted_prompt = f"""
@@ -98,12 +105,9 @@ def generate_tasklist(state: OverallState, config: RunnableConfig) -> TaskListSt
     
     result = structured_llm.invoke(formatted_prompt)
     savestate = [r.model_dump() for r in result.tasks]
-    filename = search_tool(state, thread_id)
-    if filename:
-        write_json_tool(state, savestate, thread_id, filename)
-    else:
-        write_json_tool(state, savestate, thread_id)
-    return {"task_list": result.tasks}
+    write_todo(thread_id, savestate)    
+    
+    return {"task_list": savestate}
 
 
 def select_next_task(state: OverallState):
@@ -111,208 +115,362 @@ def select_next_task(state: OverallState):
     tasks = state.get("task_list", [])
     
     for task in tasks:
-        if task.status == "Not Started":  # Not task["status"]
-            state["phase"] = "TODO"
-            filename = search_tool(state, thread_id)
-            content = {"task": task.task, "id": task.id, "status": "In Progress"}
-            edit_json_tool(state, content, thread_id, filename)
-            return {"current_task": task.task, "current_task_id": task.id}
+        if task["status"] == "Not Started":  # Not task["status"]
+            content = {"task": task["task"], "id": task["id"], "status": "In Progress"}
+            task["status"] = "In Progress"
+            write_todo(thread_id, content)
+            return {"current_task": task["task"], "current_task_id": task["id"]}
     # All tasks completed
     return {"current_task": None, "current_task_id": None}
 
+def task_router(state: OverallState) -> Literal["task", "completed"]:
+    """Task router for agent"""
+    if state["current_task"] != None and state["current_task_id"] != None:
+        return "task"
+    return "completed"
 
 
+# Optimizing code
 
-def generate_follow_question(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
-    """_summary_
+def surface_research(state: OverallState, config: RunnableConfig):
+    """Surface Research as name suggest does a light research on following topic and return a notes strcture format 
 
     Args:
-        state (OverallState): _description_
-        config (RunnableConfig): _description_
-
-    Returns:
-        QueryGenerationState: _description_
+        state (OverallState): Current graph state containing the User's question
+        config (RunnableConfig): Configration for the runnable, including LLM provideer settings
     """
-    configurable = Configration.from_runnable_config(config) 
-    llm = ChatOpenAI(
-        api_key=SecretStr(os.getenv("OPENROUTER_API_KEY") or ""),
-        temperature=1.0,
-        base_url="https://openrouter.ai/api/v1"
-    )   
-    browser_client = TavilySearch(max_results=5, 
-                                topic="general", 
-                                search_depth="basic",
-                                response_format="content",
-                                include_answer=True
-                                )
-
-    agent = create_agent(llm, tools=[browser_client])
-    response  = agent.invoke({"messages": state["messages"][0].content})
-    formatted_prompt = f"{question_generator}".format(user_question=state["messages"][0].content, search_result=response["messages"][-1].content, number_of_question=5, research_task=state["current_task"])
-    structured_llm = llm.with_structured_output(FollowQuestion)
-    result = structured_llm.invoke(formatted_prompt)
+    configurable =  Configration.from_runnable_config(config)
     
-    state["phase"] = "NOTE"
-    filename = search_tool(state, thread_id)
-    if filename:
-        write_json_tool(state, [{"id":1, "question": state["messages"][0].content, "note": response["messages"][-1].content}], thread_id, filename)
-    else:
-        write_json_tool(state, [{"id":1, "question": state["messages"][0].content, "note": response["messages"][-1].content}], thread_id)
+    # Setup
+    llm = get_llm(temperature=0.3) 
+
+    agent = create_agent(llm, tools=[tavily_search_basic])
+
+    surface_research_prompt = f"You are a light research agent whos task is search web for a topic provide by a user. \n\n you will be provided with breif task, which will be the end goal and each task to will take you closer to end goal your task is to foucs on task provided and research web but make sure you research supports the end goal. \n\n"
     
-    state["phase"] = "QUESTION"
-    savestate = [r.model_dump() for r in result.question]
-    filename = search_tool(state, thread_id)
-    if filename:
-        write_json_tool(state, savestate, thread_id, filename)
-    else:
-        write_json_tool(state, savestate, thread_id)
-        
-    state["phase"] = "SOURCE"
-    sources = []
-    for msg in response["messages"]:
-        if isinstance(msg, ToolMessage):
-            for count, i in enumerate(json.loads(msg.content)["results"]):
-                i["id"] = count
-                sources.append(i)
-    filename = search_tool(state, thread_id)
-    if filename:
-        write_json_tool(state, sources, thread_id, filename)
-    else:
-        write_json_tool(state, sources, thread_id)
-        
-    return {"query": result.question}
-
-
-
-
-def summarize_conversation_node(state: OverallState):
-    """Node function to summarize conversation"""
-    messages = state.get("messages", [])
-    
-    # Don't summarize if not needed
-    if len(messages) <= 10:
-        return {}
-
-    
-    llm = ChatOpenAI(
-        api_key=SecretStr(os.getenv("OPENROUTER_API_KEY") or ""),
-        temperature=1.0,
-        base_url="https://openrouter.ai/api/v1"
-    ) 
-    
-    # Summarize old messages, keep recent ones
-    to_summarize = messages[:-5]
-    to_keep = messages[-5:]
-    
-    if to_summarize:
-        summary_prompt = f"""Briefly summarize this research conversation:
-
-        {chr(10).join([f"{m.type}: {m.content[:150]}..." for m in to_summarize])}
-
-        Provide a 2-3 sentence summary:"""
-        
-        summary = llm.invoke(summary_prompt)
-        
-        return {
-            "messages": [
-                SystemMessage(content=f"📋 Summary: {summary.content}"),
-                *to_keep
-            ]
-        }
-    
-    return {}
-
-def deep_research(state: Query, config: RunnableConfig) -> OverallState:
-    configurable = Configration.from_runnable_config(config) 
-    llm = ChatOpenAI(
-        api_key=SecretStr(os.getenv("OPENROUTER_API_KEY") or ""),
-        temperature=1.0,
-        base_url="https://openrouter.ai/api/v1"
-    )  
-    browser_client = TavilySearch(max_results=5, 
-                                topic="general", 
-                                search_depth="advanced",
-                                response_format="content",
-                                include_answer=True
-                                )
-    agent = create_agent(llm, tools=[browser_client])
-    response  = agent.invoke({"messages": state.query}, config={"max_tokens": 1000})
-    
-    phase = {"phase":"SOURCE"}
-    sources = []
-    for msg in response["messages"]:
-        if isinstance(msg, ToolMessage):
-            for count, i in enumerate(json.loads(msg.content)["results"]):
-                i["id"] = count
-                sources.append(i)
-    filename = search_tool(phase, thread_id)
-    if filename:
-        write_json_tool(phase, sources, thread_id, filename)
-    else:
-        write_json_tool(phase, sources, thread_id)
-
-
+    message = f"Breif Task: {state["brief"]}, Your Task to Resaerch : {state["current_task"]}"
+    response = agent.invoke({"messages": [SystemMessage(content=surface_research_prompt), HumanMessage(content=message)]})
+    joined_text = ""
     for message in response["messages"]:
-        if isinstance(message, ToolMessage):            
-            phase = {"phase":"NOTE"}
-            filename = search_tool(phase, thread_id)
-            if filename:
-                write_json_tool(phase, [{"id":1, "question": json.loads(message.content)["query"], "note": json.loads(message.content)["answer"]}], thread_id, filename)
-            else:
-                write_json_tool(phase, [{"id":1, "question": json.loads(message.content)["query"], "note": json.loads(message.content)["answer"]}], thread_id)
-            
-            phase = {"phase":"SOURCE"}
-            sources = []
-            for count, i in enumerate(json.loads(message.content)["results"]):
-                i["id"] = count
-                sources.append(i)
-            filename = search_tool(phase, thread_id)
-            if filename:
-                write_json_tool(phase, sources, thread_id, filename)
-            else:
-                write_json_tool(phase, sources, thread_id)
+        if isinstance(message, ToolMessage):
+            try:
+                # Handle empty content
+                if not message.content or message.content.strip() == "":
+                    print("Skipping empty message content")
+                    continue
+                    
+                content = json.loads(message.content)
+                
+                if "error" in content:
+                    print(f"Skipping error message: {content['error']}")
+                    continue
+                
+                if "results" not in content:
+                    continue
+                
+                for count, result in enumerate(content["results"]):
+                    if "content" in result and result["content"]:
+                        joined_text += result["content"] + "\n\n"
+                        result["id"] = count
+                write_file("sources", thread_id, content["results"])
+            except json.JSONDecodeError as e:
+                print(f"Failed to parse message content as JSON: {e}")
+                print(f"Content was: {message.content[:200]}...")  # Show first 200 chars
+                continue
+            except Exception as e:
+                print(f"Unexpected error processing message: {e}")
+                continue
+            notes = [{
+                "id": 1,
+                "question": state["current_task"],
+                "note": content.get("answer", "No answer available")
+            }]
+            write_file("notes", thread_id, notes)
+
+    joined_text = joined_text.strip()
+    return {"research": joined_text}
+    
+                                                                                                                                                                                                                                                                                                                                                                                                                                                        
+
+def generate_followup_question(state: OverallState, config: RunnableConfig):
+    """Generate follow-up question based on initial research"""
+
+    configurable =  Configration.from_runnable_config(config)
+    llm = get_llm(temperature=0.3)
+    
+    formatted_prompt = question_generator.format(research_task=state["brief"], search_result=state["research"], number_of_question=configurable.max_follow_up_question)
+    structured_llm = llm.with_structured_output(FollowQuestion)
+    
+    response = structured_llm.invoke(formatted_prompt)
+    
+    if response:
+        question = [ques.model_dump() for ques in response.question]
+        write_file("question", thread_id, question)
         
-    return {"sources": sources}
-    
+    return {"query": response.question}
 
     
-def fan_out_followups(state: OverallState):
+
+def parallel_research(state: OverallState, config: RunnableConfig):
+    """Parallel research agent which search web for follow up question"""
     
-    queries = state.get("query", [])
+    configurable = Configration.from_runnable_config(config)
+    sends = [Send("deep_research", {"query": q}) for q in state["query"]]
+
+    return Command(
+        update={},
+        goto=sends
+    )
+
+
+def deep_research(state: Query, config: RunnableConfig):
+    """Deep research function researchs deep about the following problem"""
     
-    if not queries:
-        print("WARNING: No queries to fan out!")
-        return {}
+    configurable = Configration.from_runnable_config(config)
     
-    # Send each Query object to deep_research
-    sends = [
-        Send("deep_research", query)  # Send the entire Query dict
-        for query in queries
-    ]
+    llm = get_llm(temperature=0)
+
+    agent = create_agent(llm, tools=[tavily_search])
     
-    return Command(goto=sends)
+    query_obj = state["query"]
+    if hasattr(query_obj, 'query'):
+        query_text = query_obj.query
+    elif hasattr(query_obj, 'model_dump'):
+        query_data = query_obj.model_dump()
+        query_text = query_data.get('query', str(query_obj))
+    else:
+        query_text = str(query_obj)
+    
+    response  = agent.invoke({"messages": HumanMessage(content=query_text)})
+    sources = []
+    notes = []
+    
+    for count, resp in enumerate(reversed(response["messages"])):
+        if isinstance(resp, ToolMessage):
+            try:
+                # First try JSON parsing
+                content = json.loads(resp.content)
+            except json.JSONDecodeError:
+                try:
+                    # Then try literal eval
+                    content = ast.literal_eval(resp.content)
+                except (ValueError, SyntaxError):
+                    # If both fail, skip this message or handle as plain text
+                    print(f"Could not parse tool message content: {resp.content[:100]}...")
+                    continue
+            
+            if isinstance(content, str):
+                # If content is just a string, skip it
+                print(f"Skipping string content: {content[:100]}...")
+                continue
+            
+            if not isinstance(content, dict):
+                print(f"Content is not a dictionary: {type(content)}")
+                continue
+            
+            if "error" in content:
+                print(f"Search tool returned error: {content['error']}")
+                continue
+            
+            if "query" not in content or "results" not in content:
+                print(f"Invalid content structure: {content.keys()}")
+                continue
+            
+            note_data = {
+                "id": count,
+                "question": content.get("query", "Unknown"),
+                "note": content.get("answer", "No answer available")
+            }
+            
+            for count, source in enumerate(content.get("results", [])):
+                source["id"] = count
+                sources.append(source)
+            notes.append(note_data)     
+    existing_notes = read_file("notes", thread_id) 
+    existing_sources = read_file("sources", thread_id)    
+    for note in notes:
+        note["id"] = len(existing_notes) + 1
+        existing_notes.append(note)
+    
+    for source in sources:
+        source["id"] = len(existing_sources) + 1
+        existing_sources.append(source)
+    write_file("notes", thread_id, existing_notes)
+    write_file("sources", thread_id, existing_sources)
+    
+    return {"search_response": sources, "search_notes": notes}
+    
+def classifier_research(state: OverallState, config: RunnableConfig):
+    """Classifer to determine research heading"""
+    
+    content = "Notes: \n"
+    
+    for note in state["search_notes"]:
+        content += note["note"] + "\n"
+        
+    content += "\n Sources: \n"
+    for source in state["search_response"]:
+        content += source["content"] + "\n\n"
+    
+    llm = get_llm(temperature=0.3)
+    structure_llm = llm.with_structured_output(Classifier)
+    
+    response = structure_llm.invoke([SystemMessage(content=classifier), HumanMessage(content=content)])
+    return {"classifier": response.sections}
+
+
+
+def parallel_drafter(state: OverallState, config: RunnableConfig):
+    """If classifier has two section it will sent to drafter according"""
+    
+    configurable = Configration.from_runnable_config(config)
+    sends = [Send("generate_draft", {"classifier": q, 
+                                    "search_response": state.get("search_response", []),
+                                    "research_notes": state.get("research_notes", []),
+                                    "current_task_id": state.get("current_task_id"),
+                                    "current_task": state.get("current_task"),
+                                    "brief": state.get("brief")}) for q in state["classifier"]]
+    return Command(
+        update={},
+        goto=sends
+    )
+
+
+def generate_draft(state: OverallState, config: RunnableConfig):
+    """Generate draft according user input for section"""
+    
+    configrurable = Configration.from_runnable_config(config)
+    llm = get_llm(temperature=1.0)
+    structured_llm = llm.with_structured_output(Draft)
+    formatted_prompt = draft_writer.format(section_name=state["classifier"], target_audience="Academic Researcher", tone="Professional", research_data=state["search_response"], brief_question=state["brief"])
+    response = structured_llm.invoke([HumanMessage(content=formatted_prompt)])
+    
+    
+    current_task_id = state.get("current_task_id")
+    if current_task_id is not None:
+        tasks = state.get("task_list", [])
+        for task in tasks:
+            if task["id"] == current_task_id:
+                task["status"] = "Completed"
+                write_todo(thread_id, task)
+                break    
+    write_file("draft", thread_id, [response.model_dump()])
+    
+    return {"search_response": [], "search_notes": [], "draft": [response.model_dump()]}
+    
+    
+def reroute_task_selection(state: OverallState, config: RunnableConfig):
+    return "task"
+    
+    
+
+def summarize_conversation_node(state: OverallState, config: RunnableConfig):
+    """Summarize conversation using token manager to fit within context limits"""
+    
+    configrurable = Configration.from_runnable_config(config)
+    llm = get_llm(temperature=0.5)  # Lower temp for more consistent summaries
+    
+    # Only summarize if we have more than 3 messages
+    if len(state["messages"]) > 3:
+        # Keep the last 3 messages, summarize the rest
+        messages_to_summarize = state["messages"][:-3]
+        messages_to_keep = state["messages"][-3:]
+        
+        # Build conversation text from messages to summarize
+        previous_conversation = ""
+        for msg in messages_to_summarize:
+            if isinstance(msg, HumanMessage):
+                previous_conversation += f"User: {msg.content}\n\n"
+            elif isinstance(msg, AIMessage):
+                previous_conversation += f"Assistant: {msg.content}\n\n"
+            elif isinstance(msg, SystemMessage):
+                previous_conversation += f"System: {msg.content}\n\n"
+            elif isinstance(msg, ToolMessage):
+                previous_conversation += f"Tool ({msg.name}): {msg.content[:200]}...\n\n"
+        
+        # Create summarization prompt
+        system_prompt = """You are a helpful assistant whose task is to gather information from the conversation history 
+                and keep all the important information while summarizing the memory. Focus on:
+                - Key decisions and conclusions
+                - Important facts and data discovered
+                - User's goals and requirements
+                - Progress made on tasks
+
+                Create a concise summary that preserves critical context."""
+                        
+        user_prompt = f"""Summarize this conversation history:
+
+                {previous_conversation}
+
+                Provide a concise summary that captures all important information."""
+
+        try:
+            response = llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt)
+            ])
+            
+            # Create a summary message
+            summary_message = SystemMessage(
+                content=f"[Conversation Summary]: {response.content}"
+            )
+            
+            # Return summary + recent messages
+            return {"messages": [summary_message] + messages_to_keep}
+            
+        except Exception as e:
+            print(f"Summarization failed: {e}")
+            # If summarization fails, just keep recent messages
+            return {"messages": messages_to_keep}
+    
+    # If 3 or fewer messages, no need to summarize
+    return {"messages": state["messages"]}
+
+
+
+
+
 checkpointer = MemorySaver()
-config = {"configurable": {"thread_id": thread_id}}
+config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100}
 builder = StateGraph(OverallState, context_schema=Configration)
-builder.add_node("generate_breif_question", indepth_reasoning)
-builder.add_node("generate_todo", generate_tasklist)
+
+
+builder.add_node("indepth_reasoning", indepth_reasoning)
+builder.add_node("generate_tasklist", generate_tasklist)
 builder.add_node("select_next_task", select_next_task)
-builder.add_node("summarize_messages", summarize_conversation_node)
-builder.add_node("generate_follow_question", generate_follow_question)
-builder.add_node("fan_out_followups", fan_out_followups)
+builder.add_node("task_router", task_router)
+builder.add_node("surface_research", surface_research)
+builder.add_node("generate_followup_question", generate_followup_question)
+builder.add_node("parallel_research", parallel_research)
 builder.add_node("deep_research", deep_research)
+builder.add_node("classifier_research", classifier_research)
+builder.add_node("parallel_drafter", parallel_drafter)
+builder.add_node("generate_draft", generate_draft)
+builder.add_node("reroute_task_selection", reroute_task_selection)
+builder.add_node("summarize_conversation_node", summarize_conversation_node)
 
-builder.add_edge(START, "generate_breif_question")
-builder.add_edge("generate_breif_question", "generate_todo")
-builder.add_edge("generate_todo", "select_next_task")
-builder.add_edge("select_next_task", "summarize_messages")
-builder.add_edge("summarize_messages", "generate_follow_question")
-builder.add_edge("generate_follow_question", "fan_out_followups")
-builder.add_edge("deep_research", END)
 
-# graph = builder.compile(name="pro-search-agent", checkpointer=checkpointer)
+builder.add_edge(START, "indepth_reasoning")
+builder.add_edge("indepth_reasoning", "generate_tasklist")
+builder.add_edge("generate_tasklist", "select_next_task")
+builder.add_conditional_edges("select_next_task", task_router, {"task": "surface_research", "completed": END})
+builder.add_edge("surface_research", "generate_followup_question")
+builder.add_edge("generate_followup_question", "parallel_research")
+builder.add_edge("deep_research", "classifier_research")
+builder.add_edge("classifier_research", "parallel_drafter")
+builder.add_edge("generate_draft", "summarize_conversation_node")
+builder.add_conditional_edges(
+    "summarize_conversation_node", reroute_task_selection, {
+        "task": "select_next_task",
+        "completed": END
+    }
+)
+
 graph = builder.compile(name="pro-search-agent")
-for chunk in graph.stream({"messages": HumanMessage(content="I need to research about quantum computing and its mordern application,")}, stream_mode="updates", config=config):
-    print(chunk)
-# 
 
+for chunk in graph.stream(
+    {"messages": [HumanMessage(content="I want to research about band aware transformer which can work in any kind of Image HSI MSI or RGB")]}, 
+    stream_mode="updates",
+    config=config
+):
+    print(chunk)
