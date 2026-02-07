@@ -31,7 +31,7 @@ class Configration(BaseModel):
     )
     
     max_follow_up_question: int = Field(
-        default=5,
+        default=3,
         description="Maximum number of follow up question asked by user."
     )
     
