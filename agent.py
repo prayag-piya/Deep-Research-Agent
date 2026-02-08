@@ -3,33 +3,29 @@ import json
 import ast 
 from typing import Literal
 from functools import lru_cache
-from datetime import datetime
-import uuid
-from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
-from langchain_core.rate_limiters import InMemoryRateLimiter
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Send, Command
 from langgraph.graph import StateGraph, START, END
 from langchain_core.runnables import RunnableConfig
 from langchain.agents import create_agent
 
-from states import OverallState, QueryGenerationState, TaskListState, Query
-from schema import TaskListSchema, FollowQuestion, Classifier, Draft, SearchQuery
+from states import OverallState, TaskListState, Query
+from schema import TaskListSchema, FollowQuestion, Classifier
 from configration import Configration
 from prompt import todo_task, ask_detail_question, brief_answer, question_generator, classifier, draft_writer
-from utils import get_task_topic, TokenManger
-from tools import write_file, write_todo, read_file, tavily_search_basic, tavily_search
+from utils import get_task_topic
+from tools import write_file, write_todo, tavily_search_basic, tavily_search
 
 from langchain_ollama import ChatOllama
 # from langchain_openai import ChatOpenAI
+from writer_agent import run_writer_agent
 
 load_dotenv(find_dotenv())
 
 thread_id = "hsi"
 
-rate_limiter = InMemoryRateLimiter(requests_per_second=0.1, max_bucket_size=10)
 
 if os.getenv("OPENROUTER_API_KEY") is None:
     raise ValueError("OPENROUTER Key not Found.")
@@ -94,7 +90,7 @@ def generate_tasklist(state: OverallState, config: RunnableConfig) -> TaskListSt
     """
     configurable = Configration.from_runnable_config(config)
     llm = get_llm(temperature=0.3)
-    
+    llm = llm.bind(format="json")
     structured_llm = llm.with_structured_output(TaskListSchema)
     formatted_prompt = f"""
                         {todo_task}
@@ -152,7 +148,7 @@ def surface_research(state: OverallState, config: RunnableConfig):
     response = agent.invoke({"messages": [SystemMessage(content=surface_research_prompt), HumanMessage(content=message)]})
     joined_text = ""
     for message in response["messages"]:
-        if isinstance(message, ToolMessage):
+        if isinstance(message, ToolMessage) and message.name == "tavily_search_basic":
             try:
                 # Handle empty content
                 if not message.content or message.content.strip() == "":
@@ -197,7 +193,7 @@ def generate_followup_question(state: OverallState, config: RunnableConfig):
 
     configurable =  Configration.from_runnable_config(config)
     llm = get_llm(temperature=0.3)
-    
+    llm = llm.bind(format="json")
     formatted_prompt = question_generator.format(research_task=state["brief"], search_result=state["research"], number_of_question=configurable.max_follow_up_question)
     structured_llm = llm.with_structured_output(FollowQuestion)
     
@@ -216,7 +212,7 @@ def parallel_research(state: OverallState, config: RunnableConfig):
     
     configurable = Configration.from_runnable_config(config)
     sends = [Send("deep_research", {"query": q}) for q in state["query"]]
-
+    
     return Command(
         update={},
         goto=sends
@@ -227,10 +223,9 @@ def deep_research(state: Query, config: RunnableConfig):
     """Deep research function researchs deep about the following problem"""
     
     configurable = Configration.from_runnable_config(config)
-    
     llm = get_llm(temperature=0)
-
     agent = create_agent(llm, tools=[tavily_search])
+    
     
     query_obj = state["query"]
     if hasattr(query_obj, 'query'):
@@ -240,6 +235,7 @@ def deep_research(state: Query, config: RunnableConfig):
         query_text = query_data.get('query', str(query_obj))
     else:
         query_text = str(query_obj)
+    
     
     response  = agent.invoke({"messages": HumanMessage(content=query_text)})
     sources = []
@@ -286,17 +282,8 @@ def deep_research(state: Query, config: RunnableConfig):
                 source["id"] = count
                 sources.append(source)
             notes.append(note_data)     
-    existing_notes = read_file("notes", thread_id) 
-    existing_sources = read_file("sources", thread_id)    
-    for note in notes:
-        note["id"] = len(existing_notes) + 1
-        existing_notes.append(note)
-    
-    for source in sources:
-        source["id"] = len(existing_sources) + 1
-        existing_sources.append(source)
-    write_file("notes", thread_id, existing_notes)
-    write_file("sources", thread_id, existing_sources)
+    write_file("notes", thread_id, notes)
+    write_file("sources", thread_id, sources)
     
     return {"search_response": sources, "search_notes": notes}
     
@@ -306,13 +293,14 @@ def classifier_research(state: OverallState, config: RunnableConfig):
     content = "Notes: \n"
     
     for note in state["search_notes"]:
-        content += note["note"] + "\n"
+        content += (note.get("note") or "") + "\n"
         
     content += "\n Sources: \n"
     for source in state["search_response"]:
-        content += source["content"] + "\n\n"
+        content += (source.get("content") or "") + "\n\n"
     
     llm = get_llm(temperature=0.3)
+    llm = llm.bind(format="json")
     structure_llm = llm.with_structured_output(Classifier)
     
     response = structure_llm.invoke([SystemMessage(content=classifier), HumanMessage(content=content)])
@@ -341,31 +329,54 @@ def generate_draft(state: OverallState, config: RunnableConfig):
     
     configrurable = Configration.from_runnable_config(config)
     llm = get_llm(temperature=1.0)
-    structured_llm = llm.with_structured_output(Draft)
-    formatted_prompt = draft_writer.format(section_name=state["classifier"], target_audience="Academic Researcher", tone="Professional", research_data=state["search_response"], brief_question=state["brief"])
-    response = structured_llm.invoke([HumanMessage(content=formatted_prompt)])
+    formatted_prompt = f"\n\nSection: \n\n {state["classifier"]} \n\n Researching about : {state["brief"]} \n\n Research data : {state["search_response"]}"
+    # formatted_prompt = draft_writer.format(section_name=state["classifier"], target_audience="Academic Researcher", tone="Professional", research_data=state["search_response"], brief_question=state["brief"])
+    response = llm.invoke([SystemMessage(content=draft_writer), HumanMessage(content=formatted_prompt)])
+    
+    resp = {"content": response.content, "id": 1, "section": state["classifier"]}
     
     
     current_task_id = state.get("current_task_id")
     if current_task_id is not None:
-        tasks = state.get("task_list", [])
-        for task in tasks:
-            if task["id"] == current_task_id:
-                task["status"] = "Completed"
-                write_todo(thread_id, task)
-                break    
-    write_file("draft", thread_id, [response.model_dump()])
+        write_todo(thread_id, {"task": state.get("current_task", ""), "id": current_task_id, "status": "Completed"})
+    write_file("draft", thread_id, [resp])
     
-    return {"search_response": [], "search_notes": [], "draft": [response.model_dump()]}
+    return {"search_response": [], "search_notes": [], "draft": [resp]}
     
     
 def reroute_task_selection(state: OverallState, config: RunnableConfig):
+    """Check if all tasks are done; if so, route to writer, else next task."""
+    tasks = state.get("task_list", [])
+    if not tasks:
+        return "completed"
+    all_done = all(t.get("status") == "Completed" for t in tasks)
+    if all_done:
+        print("[reroute] All tasks completed — routing to write_report")
+        return "completed"
+    remaining = [t["task"] for t in tasks if t.get("status") != "Completed"]
+    print(f"[reroute] {len(remaining)} tasks remaining — continuing research")
     return "task"
+
+
+def write_report_node(state: OverallState, config: RunnableConfig):
+    """Run the writer agent to produce the final formatted report."""
+    report = run_writer_agent(tid=thread_id)
+    print(f"[write_report_node] Final report generated ({len(report)} chars)")
+    return {"messages": [AIMessage(content=report)]}
     
     
 
 def summarize_conversation_node(state: OverallState, config: RunnableConfig):
-    """Summarize conversation using token manager to fit within context limits"""
+    """Mark current task as completed in state, then summarize conversation."""
+    
+    # ── Update task_list to mark current task completed ──
+    current_task_id = state.get("current_task_id")
+    tasks = state.get("task_list", [])
+    if current_task_id is not None:
+        for task in tasks:
+            if task["id"] == current_task_id:
+                task["status"] = "Completed"
+                break
     
     configrurable = Configration.from_runnable_config(config)
     llm = get_llm(temperature=0.5)  # Lower temp for more consistent summaries
@@ -416,22 +427,22 @@ def summarize_conversation_node(state: OverallState, config: RunnableConfig):
             )
             
             # Return summary + recent messages
-            return {"messages": [summary_message] + messages_to_keep}
+            return {"messages": [summary_message] + messages_to_keep, "task_list": tasks}
             
         except Exception as e:
             print(f"Summarization failed: {e}")
             # If summarization fails, just keep recent messages
-            return {"messages": messages_to_keep}
+            return {"messages": messages_to_keep, "task_list": tasks}
     
     # If 3 or fewer messages, no need to summarize
-    return {"messages": state["messages"]}
+    return {"messages": state["messages"], "task_list": tasks}
 
 
 
 
 
 checkpointer = MemorySaver()
-config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100}
+config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 150}
 builder = StateGraph(OverallState, context_schema=Configration)
 
 
@@ -448,12 +459,14 @@ builder.add_node("parallel_drafter", parallel_drafter)
 builder.add_node("generate_draft", generate_draft)
 builder.add_node("reroute_task_selection", reroute_task_selection)
 builder.add_node("summarize_conversation_node", summarize_conversation_node)
+builder.add_node("write_report", write_report_node)
 
 
 builder.add_edge(START, "indepth_reasoning")
 builder.add_edge("indepth_reasoning", "generate_tasklist")
 builder.add_edge("generate_tasklist", "select_next_task")
-builder.add_conditional_edges("select_next_task", task_router, {"task": "surface_research", "completed": END})
+builder.add_conditional_edges("select_next_task", task_router, {"task": "surface_research", "completed": "write_report"})
+builder.add_edge("write_report", END)
 builder.add_edge("surface_research", "generate_followup_question")
 builder.add_edge("generate_followup_question", "parallel_research")
 builder.add_edge("deep_research", "classifier_research")
@@ -462,14 +475,17 @@ builder.add_edge("generate_draft", "summarize_conversation_node")
 builder.add_conditional_edges(
     "summarize_conversation_node", reroute_task_selection, {
         "task": "select_next_task",
-        "completed": END
+        "completed": "write_report"
     }
 )
 
 graph = builder.compile(name="pro-search-agent")
 
+user_input = input("Enter research question >> ")
+thread_id = input("Enter unique thread id >> ")
+
 for chunk in graph.stream(
-    {"messages": [HumanMessage(content="I want to research about band aware transformer which can work in any kind of Image HSI MSI or RGB")]}, 
+    {"messages": [HumanMessage(content=user_input)]}, 
     stream_mode="updates",
     config=config
 ):
