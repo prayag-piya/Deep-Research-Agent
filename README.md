@@ -163,7 +163,7 @@ Edit `configration.py` or pass values via LangGraph's `RunnableConfig`:
 
 | Parameter               | Default                                    | Description                                   |
 |-------------------------|--------------------------------------------|-----------------------------------------------|
-| `query_generation_model`| `nvidia/nemotron-3-nano-30b-a3b:free`      | Model for query generation                    |
+| `query_generation_model`| `llama3.2:latest`                          | Model for query generation                    |
 | `query_count`           | `3`                                        | Number of initial search queries              |
 | `max_question`          | `3`                                        | Clarifying questions to ask the user          |
 | `max_research_loop`     | `3`                                        | Max research iterations per topic             |
