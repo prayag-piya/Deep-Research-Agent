@@ -11,7 +11,7 @@ class Configration(BaseModel):
     """
     
     query_generation_model: str = Field(
-        default="nvidia/nemotron-3-nano-30b-a3b:free",
+        default="llama3.2:latest",
         description="Name of the model for to use for query generation"
     )
     

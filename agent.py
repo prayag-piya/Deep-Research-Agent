@@ -38,15 +38,13 @@ def get_llm(model: str = "llama3.2:latest", temperature: float = 0.7) -> ChatOll
     return ChatOllama(
         model=model,
         temperature=temperature,
-        # api_key=os.getenv("OPENROUTER_API_KEY"),
-        # base_url="https://openrouter.ai/api/v1"
     )
 
 
 def indepth_reasoning(state: OverallState, config: RunnableConfig):
     """Langgraph node that asks user question to understand about their query
     
-    Uses Nvidia Nemontron 3 to create an optimized question to understand users initial query.
+    Uses llama3.2:latest to create an optimized question to understand users initial query.
 
     Args:
         state (OverallState): Current graph state containing the User's question
@@ -79,7 +77,7 @@ def indepth_reasoning(state: OverallState, config: RunnableConfig):
 def generate_tasklist(state: OverallState, config: RunnableConfig) -> TaskListState:
     """Langgraph node that generate overall plan for the task base on user's question.
     
-    Uses Nvidia Nemotron 3 to create an optimized refine plan to solve user query.
+    Uses llama3.2:latest to create an optimized refine plan to solve user query.
 
     Args:
         state (OverallState): Current graph state containing the User's question
