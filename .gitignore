@@ -31,3 +31,6 @@ Thumbs.db
 
 # Poetry
 poetry.lock
+
+# LangGraph local state
+.langgraph_api/
